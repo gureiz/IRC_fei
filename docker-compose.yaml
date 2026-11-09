@@ -1,0 +1,45 @@
+services:
+
+  broker:
+    build: ./broker
+    container_name: broker
+
+  servidor1:
+    build: ./servidor
+    container_name: servidor1
+    environment:
+      SERVER_NAME: servidor1
+      TZ: America/Sao_Paulo
+    volumes:
+      - ./dados/servidor1:/data
+    depends_on:
+      - broker
+
+  servidor2:
+    build: ./servidor
+    container_name: servidor2
+    environment:
+      SERVER_NAME: servidor2
+      TZ: America/Sao_Paulo
+    volumes:
+      - ./dados/servidor2:/data
+    depends_on:
+      - broker
+
+  cliente1:
+    build: ./cliente
+    container_name: cliente1
+    environment:
+      BOT_NAME: bot1
+      TZ: America/Sao_Paulo
+    depends_on:
+      - broker
+
+  cliente2:
+    build: ./cliente
+    container_name: cliente2
+    environment:
+      BOT_NAME: bot2
+      TZ: America/Sao_Paulo
+    depends_on:
+      - broker
