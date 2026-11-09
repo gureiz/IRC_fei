@@ -9,7 +9,12 @@ import zmq
 # Configurações vindas do docker-compose (cada servidor tem seu nome e seu próprio banco)
 NOME = os.environ.get("SERVER_NAME", "servidor")
 BROKER = os.environ.get("BROKER_ADDR", "tcp://broker:5556")
+PROXY = os.environ.get("PROXY_ADDR", "tcp://proxy:5557")
 DB_PATH = os.environ.get("DB_PATH", f"/data/{NOME}.db")
+
+context = zmq.Context()
+# PUB: o servidor publica as mensagens no proxy, usando o nome do canal como tópico
+pub = context.socket(zmq.PUB)
 
 # Timestamp em milissegundos
 def agora():
@@ -47,6 +52,11 @@ def abrir_db():
         "CREATE TABLE IF NOT EXISTS canais ("
         "nome TEXT PRIMARY KEY, criador TEXT NOT NULL, timestamp INTEGER NOT NULL)"
     )
+    db.execute(
+        "CREATE TABLE IF NOT EXISTS publicacoes ("
+        "canal TEXT NOT NULL, usuario TEXT NOT NULL, mensagem TEXT NOT NULL, "
+        "timestamp_envio INTEGER NOT NULL, timestamp_publicacao INTEGER NOT NULL)"
+    )
     db.commit()
     return db
 
@@ -80,11 +90,34 @@ def listar_canais(db, req):
     return {"status": "ok", "channels": canais}
 
 
+# Publicação: salva no banco e publica no canal (tópico = nome do canal).
+def publicar(db, req):
+    canal = req.get("channel")
+    mensagem = req.get("message")
+    if not canal or not isinstance(canal, str):
+        return {"status": "error", "error": "nome de canal vazio"}
+    if not mensagem or not isinstance(mensagem, str):
+        return {"status": "error", "error": "mensagem vazia"}
+
+    publicacao = {"channel": canal, "user": str(req.get("user")), "message": mensagem, "timestamp": agora()}
+    db.execute(
+        "INSERT INTO publicacoes VALUES (?, ?, ?, ?, ?)",
+        (canal, publicacao["user"], mensagem, req["timestamp"], publicacao["timestamp"]),
+    )
+    db.commit()
+
+    # a publicação vai em duas partes: o tópico e a mensagem serializada em MessagePack
+    pub.send_multipart([canal.encode(), msgpack.packb(publicacao)])
+    exibir(f">>> PUBLICADO [{canal}]", publicacao)
+    return {"status": "ok"}
+
+
 # Cada valor do campo "op" da mensagem chama uma função
 OPERACOES = {
     "login": login,
     "create_channel": criar_canal,
     "list_channels": listar_canais,
+    "publish": publicar,
 }
 
 
@@ -112,11 +145,11 @@ def tratar(db, dados):
 
 def main():
     db = abrir_db()
-    context = zmq.Context()
     # O servidor é o lado REP do Request-Reply e se conecta no DEALER do broker
     socket = context.socket(zmq.REP)
     socket.connect(BROKER)
-    print(f"[{NOME}] conectado ao broker {BROKER}, dados em {DB_PATH}", flush=True)
+    pub.connect(PROXY)
+    print(f"[{NOME}] conectado ao broker {BROKER} e ao proxy {PROXY}, dados em {DB_PATH}", flush=True)
 
     # No REP é sempre recebe -> responde, uma requisição por vez
     while True:

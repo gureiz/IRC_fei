@@ -4,6 +4,10 @@ services:
     build: ./broker
     container_name: broker
 
+  proxy:
+    build: ./proxy
+    container_name: proxy
+
   servidor1:
     build: ./servidor
     container_name: servidor1
@@ -14,6 +18,7 @@ services:
       - ./dados/servidor1:/data
     depends_on:
       - broker
+      - proxy
 
   servidor2:
     build: ./servidor
@@ -25,6 +30,7 @@ services:
       - ./dados/servidor2:/data
     depends_on:
       - broker
+      - proxy
 
   cliente1:
     build: ./cliente
@@ -34,6 +40,7 @@ services:
       TZ: America/Sao_Paulo
     depends_on:
       - broker
+      - proxy
 
   cliente2:
     build: ./cliente
@@ -43,3 +50,4 @@ services:
       TZ: America/Sao_Paulo
     depends_on:
       - broker
+      - proxy

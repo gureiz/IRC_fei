@@ -20,10 +20,19 @@ import org.zeromq.SocketType;
 import org.zeromq.ZContext;
 import org.zeromq.ZMQ;
 
-// Bot (cliente) do projeto. Roda sozinho, sem interação: faz login, lista os canais e cria um canal se precisar. Fala com os servidores pelo broker (padrão Request-Reply).
+// Bot (cliente) do projeto. Roda sozinho, sem interação: faz login, lista e cria canais, se inscreve em canais e publica mensagens.
+// Fala com os servidores pelo broker (Request-Reply) e recebe as publicações pelo proxy (Pub/Sub).
 public class Bot {
     static final String BROKER = System.getenv().getOrDefault("BROKER_ADDR", "tcp://broker:5555");
+    static final String PROXY = System.getenv().getOrDefault("PROXY_ADDR", "tcp://proxy:5558");
     static final int MIN_CANAIS = 5;
+    static final int MIN_INSCRICOES = 3;
+    // Mensagens que o bot sorteia para publicar
+    static final String[] MENSAGENS = {
+        "Bom dia, pessoal!", "Alguem viu o jogo ontem?", "Qual a boa de hoje?",
+        "Recomendo muito esse livro", "Que calor hoje", "Testando o canal",
+        "Alguma novidade?", "Ate mais!", "Concordo totalmente", "Boa noite a todos"
+    };
     // Nomes que o bot sorteia quando vai criar um canal
     static final String[] NOMES_CANAIS = {
         "geral", "noticias", "esportes", "musica", "filmes",
@@ -36,7 +45,9 @@ public class Bot {
     final String usuario;
     final ZContext context = new ZContext();
     final Random random = new Random();
+    final List<String> inscritos = new ArrayList<>();
     ZMQ.Socket socket;
+    ZMQ.Socket sub;
 
     Bot(String usuario) {
         this.usuario = usuario;
@@ -50,12 +61,12 @@ public class Bot {
     void executar() throws Exception {
         conectar();
 
-        // Login: uma mensagem de ida e uma de volta. Se der erro, repito o login.
+        // Login: uma mensagem de ida e uma de volta. Se der erro, repete o login.
         while (!ok(requisitar("login", Map.of()))) {
             Thread.sleep(1000);
         }
 
-        // se tiver menos de 5 canais, cria um novo com um nome que ainda não está na lista. Como cada servidor tem os seus dados, o servidor pode responder que o canal já existe; nesse caso tenta outro nome.
+        // 1. se tiver menos de 5 canais, cria um novo com um nome que ainda não está na lista. Como cada servidor tem os seus dados, o servidor pode responder que o canal já existe; nesse caso tenta outro nome.
         List<String> canais = listarCanais();
         if (canais.size() < MIN_CANAIS) {
             List<String> candidatos = new ArrayList<>(List.of(NOMES_CANAIS));
@@ -63,15 +74,63 @@ public class Bot {
             Collections.shuffle(candidatos, random);
             for (String canal : candidatos) {
                 if (ok(requisitar("create_channel", Map.of("channel", canal)))) {
+                    canais.add(canal);
                     break;
                 }
             }
         }
 
-        // Depois disso o bot fica só consultando a lista de canais de tempos em tempos
+        // 2. se estiver inscrito em menos de 3 canais, se inscreve em mais um, sorteado da lista
+        if (inscritos.size() < MIN_INSCRICOES) {
+            List<String> candidatos = new ArrayList<>(canais);
+            candidatos.removeAll(inscritos);
+            if (!candidatos.isEmpty()) {
+                inscrever(candidatos.get(random.nextInt(candidatos.size())));
+            }
+        }
+
+        // Thread separada só para receber as publicações, enquanto a principal continua fazendo as requisições
+        new Thread(this::receberPublicacoes).start();
+
+        // 3. loop infinito: escolhe um canal da lista e envia 10 mensagens aleatórias, uma por segundo
         while (true) {
-            Thread.sleep(5000);
-            listarCanais();
+            canais = listarCanais();
+            if (canais.isEmpty()) {
+                Thread.sleep(1000);
+                continue;
+            }
+            String canal = canais.get(random.nextInt(canais.size()));
+            for (int i = 0; i < 10; i++) {
+                Map<String, String> campos = new LinkedHashMap<>();
+                campos.put("channel", canal);
+                campos.put("message", MENSAGENS[random.nextInt(MENSAGENS.length)]);
+                requisitar("publish", campos);
+                Thread.sleep(1000);
+            }
+        }
+    }
+
+    // A inscrição é feita só no cliente: o SUB passa a receber as mensagens cujo tópico é o nome do canal.
+    // Dá para chamar várias vezes no mesmo socket, uma para cada canal.
+    void inscrever(String canal) {
+        sub.subscribe(canal.getBytes(ZMQ.CHARSET));
+        inscritos.add(canal);
+        System.out.println("[" + usuario + "] inscrito no canal " + canal + " (inscricoes: " + inscritos + ")");
+    }
+
+    // Cada publicação chega em duas partes: o tópico (nome do canal) e a mensagem em MessagePack.
+    // É mostrado o canal, a mensagem, o timestamp do envio e o horário em que foi recebido
+    void receberPublicacoes() {
+        while (true) {
+            String canal = sub.recvStr();
+            byte[] dados = sub.recv();
+            try {
+                Map<String, Value> msg = desserializar(dados);
+                msg.put("recebido", ValueFactory.newInteger(System.currentTimeMillis()));
+                exibir("<<< PUBLICACAO RECEBIDA [" + canal + "]", msg);
+            } catch (IOException e) {
+                System.out.println("[" + usuario + "] publicacao invalida no canal " + canal);
+            }
         }
     }
 
@@ -87,10 +146,12 @@ public class Bot {
         return canais;
     }
 
-    // O bot é o lado REQ e se conecta no ROUTER do broker
+    // O bot é o lado REQ e se conecta no ROUTER do broker; o SUB se conecta no XPUB do proxy
     void conectar() {
         socket = context.createSocket(SocketType.REQ);
         socket.connect(BROKER);
+        sub = context.createSocket(SocketType.SUB);
+        sub.connect(PROXY);
     }
 
     // Monta a requisição, serializa, envia e espera a resposta (o REQ sempre envia e depois recebe).
@@ -144,7 +205,7 @@ public class Bot {
         linhas.add("[" + usuario + "] " + direcao);
         for (Map.Entry<String, Value> e : msg.entrySet()) {
             String valor = e.getValue().toString();
-            if (e.getKey().equals("timestamp") && e.getValue().isIntegerValue()) {
+            if ((e.getKey().equals("timestamp") || e.getKey().equals("recebido")) && e.getValue().isIntegerValue()) {
                 long ms = e.getValue().asIntegerValue().toLong();
                 valor = ms + " (" + FORMATO_TS.format(Instant.ofEpochMilli(ms)) + ")";
             }
