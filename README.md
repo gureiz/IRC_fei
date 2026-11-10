@@ -1,6 +1,6 @@
 # Sistema para troca de mensagem instantânea
 
-É uma versão simples de um sistema de mensagens no estilo BBS/IRC: bots fazem login, listam e criam canais, se inscrevem em canais e publicam mensagens neles. Toda a comunicação usa ZeroMQ e tudo roda em containers com Docker Compose.
+É uma versão simples de um sistema de mensagens no estilo BBS/IRC: bots fazem login, listam e criam canais, se inscrevem em canais e publicam mensagens neles. Todas as mensagens levam um relógio lógico, e os servidores sincronizam o relógio físico com um serviço de referência. Toda a comunicação usa ZeroMQ e tudo roda em containers com Docker Compose.
 
 ### Como executar
 
@@ -14,6 +14,7 @@ docker compose up --build
 |-----------|-----------|--------|
 | `broker` | Python | Broker Request-Reply (ROUTER na porta 5555 para os clientes, DEALER na 5556 para os servidores) |
 | `proxy` | Python | Proxy Pub/Sub (XSUB na porta 5557 para os servidores, XPUB na 5558 para os bots) |
+| `referencia` | Python | Serviço de referência (REP na porta 5559): rank, lista de servidores, heartbeat e hora correta. Só fala com os servidores |
 | `servidor1`, `servidor2` | Python | Servidores (REP para as requisições, PUB para as publicações) |
 | `cliente1`, `cliente2` | Java | Bots `bot1` e `bot2` (REQ para as requisições, SUB para receber as publicações) |
 
@@ -21,7 +22,7 @@ docker compose up --build
 
 ### Linguagens
 
-Python no servidor, no broker e no proxy, Java no cliente.
+Python no servidor, no broker, no proxy e no serviço de referência, Java no cliente.
 
 ### Serialização: MessagePack
 
@@ -30,6 +31,7 @@ Java e não precisa de arquivo de esquema. Toda mensagem é um mapa com:
 
 - `op`: `login`, `create_channel`, `list_channels` ou `publish`
 - `timestamp`: horário do envio em milissegundos (em todas as mensagens)
+- `clock`: relógio lógico de quem envia (em todas as mensagens)
 - `user`: nome do bot (nas requisições)
 - `channel`: nome do canal (na criação de canal e na publicação)
 - `message`: texto da mensagem (na publicação)
@@ -57,14 +59,43 @@ mensagem. O servidor salva a publicação, publica no canal e responde `ok` ou `
 
 A publicação é enviada em duas partes:
 1. o tópico, que é o nome do canal;
-2. um mapa MessagePack com `channel`, `user` (quem publicou), `message` e `timestamp` (horário em
-   que o servidor publicou).
+2. um mapa MessagePack com `channel`, `user` (quem publicou), `message`, `timestamp` (horário em
+   que o servidor publicou) e `clock`.
 
 A inscrição nos canais é feita só no bot: o socket SUB recebe as mensagens dos tópicos em que
 se inscreveu, e pode se inscrever em vários tópicos na mesma conexão. Para cada publicação
 recebida, o bot mostra o canal, quem publicou, a mensagem, o timestamp do envio e o horário em
 que recebeu (`recebido`). As publicações são recebidas numa thread separada, para o bot
 continuar fazendo as requisições ao mesmo tempo.
+
+### Relógio lógico
+
+Bots, servidores e o serviço de referência têm um contador que começa em 0 junto com o processo:
+1. antes de enviar qualquer mensagem, o contador é incrementado e vai no campo `clock`;
+2. ao receber uma mensagem, o contador passa a ser o maior valor entre o seu e o `clock` recebido.
+
+No bot, as duas threads (requisições e recebimento das publicações) usam o mesmo contador, por
+isso os métodos do relógio são `synchronized`.
+
+### Serviço de referência e relógio físico
+
+O serviço de referência é um container novo que só conversa com os servidores, por REQ/REP
+direto na porta 5559 (sem passar pelo broker). As mensagens seguem o mesmo formato (mapa
+MessagePack com `op`, `name` do servidor, `timestamp` e `clock`):
+
+| Operação | Quando | Resposta |
+|----------|--------|----------|
+| `rank` | o servidor inicia | `rank` do servidor. O primeiro recebe 1, o segundo 2, e assim por diante; se o mesmo nome pedir de novo, recebe o mesmo rank (sem repetir nomes) |
+| `heartbeat` | a cada 10 mensagens de clientes recebidas | `status: ok` e `time`, a hora correta da referência |
+| `list` | logo depois do heartbeat | `servers`: lista com `name` e `rank` dos servidores disponíveis |
+
+Se um servidor ficar 30 segundos sem enviar heartbeat, a referência o tira da lista de
+disponíveis. Se ele voltar a enviar, volta para a lista com o mesmo rank.
+
+Como o servidor não pode mudar o relógio do container, ele guarda a diferença (`offset`) entre a
+hora correta e o seu relógio, e passa a usar o relógio corrigido em todos os timestamps. O
+cálculo considera o tempo de ida e volta do heartbeat, como na aula: com T1 = envio e T4 =
+recebimento da resposta, `offset = hora_referencia + (T4 - T1) / 2 - T4`.
 
 ### Comportamento do bot
 
@@ -97,6 +128,7 @@ timestamp também em data e hora (fuso `America/Sao_Paulo`, definido pela variá
 [bot1] >>> ENVIADO
     op        : create_channel
     timestamp : 1793937375475 (2026-11-06 00:56:15.475-03:00)
+    clock     : 5
     user      : bot1
     channel   : musica
 ```

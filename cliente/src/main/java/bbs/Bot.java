@@ -48,6 +48,8 @@ public class Bot {
     final List<String> inscritos = new ArrayList<>();
     ZMQ.Socket socket;
     ZMQ.Socket sub;
+    // Relógio lógico, começa junto com o processo. É usado pelas duas threads, por isso os métodos são synchronized.
+    long relogio = 0;
 
     Bot(String usuario) {
         this.usuario = usuario;
@@ -126,6 +128,7 @@ public class Bot {
             byte[] dados = sub.recv();
             try {
                 Map<String, Value> msg = desserializar(dados);
+                atualizarRelogio(msg);
                 msg.put("recebido", ValueFactory.newInteger(System.currentTimeMillis()));
                 exibir("<<< PUBLICACAO RECEBIDA [" + canal + "]", msg);
             } catch (IOException e) {
@@ -157,10 +160,11 @@ public class Bot {
     // Monta a requisição, serializa, envia e espera a resposta (o REQ sempre envia e depois recebe).
     // Se o servidor ainda não subiu, o recv fica esperando e o login acontece assim que o serviço estiver disponível.
     Map<String, Value> requisitar(String op, Map<String, String> campos) throws IOException {
-        // operação, timestamp do envio e usuário
+        // operação, timestamp do envio, relógio lógico e usuário
         Map<String, Value> msg = new LinkedHashMap<>();
         msg.put("op", ValueFactory.newString(op));
         msg.put("timestamp", ValueFactory.newInteger(System.currentTimeMillis()));
+        msg.put("clock", ValueFactory.newInteger(incrementarRelogio()));
         msg.put("user", ValueFactory.newString(usuario));
         campos.forEach((k, v) -> msg.put(k, ValueFactory.newString(v)));
 
@@ -168,8 +172,23 @@ public class Bot {
         exibir(">>> ENVIADO", msg);
 
         Map<String, Value> resposta = desserializar(socket.recv());
+        atualizarRelogio(resposta);
         exibir("<<< RECEBIDO", resposta);
         return resposta;
+    }
+
+    // Relógio lógico: incrementa antes de enviar cada mensagem
+    synchronized long incrementarRelogio() {
+        relogio++;
+        return relogio;
+    }
+
+    // Ao receber, fica com o maior valor entre o seu contador e o que veio na mensagem
+    synchronized void atualizarRelogio(Map<String, Value> msg) {
+        Value recebido = msg.get("clock");
+        if (recebido != null && recebido.isIntegerValue()) {
+            relogio = Math.max(relogio, recebido.asIntegerValue().toLong());
+        }
     }
 
     static boolean ok(Map<String, Value> resposta) {

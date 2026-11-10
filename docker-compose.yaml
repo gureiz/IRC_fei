@@ -8,6 +8,12 @@ services:
     build: ./proxy
     container_name: proxy
 
+  referencia:
+    build: ./referencia
+    container_name: referencia
+    environment:
+      TZ: America/Sao_Paulo
+
   servidor1:
     build: ./servidor
     container_name: servidor1
@@ -19,6 +25,7 @@ services:
     depends_on:
       - broker
       - proxy
+      - referencia
 
   servidor2:
     build: ./servidor
@@ -31,6 +38,7 @@ services:
     depends_on:
       - broker
       - proxy
+      - referencia
 
   cliente1:
     build: ./cliente

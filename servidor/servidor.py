@@ -10,15 +10,38 @@ import zmq
 NOME = os.environ.get("SERVER_NAME", "servidor")
 BROKER = os.environ.get("BROKER_ADDR", "tcp://broker:5556")
 PROXY = os.environ.get("PROXY_ADDR", "tcp://proxy:5557")
+REFERENCIA = os.environ.get("REFERENCIA_ADDR", "tcp://referencia:5559")
 DB_PATH = os.environ.get("DB_PATH", f"/data/{NOME}.db")
 
 context = zmq.Context()
 # PUB: o servidor publica as mensagens no proxy, usando o nome do canal como tópico
 pub = context.socket(zmq.PUB)
+# REQ: requisições ao serviço de referência (rank, lista de servidores e heartbeat)
+ref = context.socket(zmq.REQ)
 
-# Timestamp em milissegundos
+relogio = 0       # relógio lógico, começa junto com o processo
+offset = 0        # diferença (ms) entre o relógio local e a hora correta da referência
+rank = None
+servidores = []   # última lista de servidores recebida da referência
+
+
+# Timestamp em milissegundos, já corrigido com a hora da referência
 def agora():
-    return int(time.time() * 1000)
+    return int(time.time() * 1000) + offset
+
+
+# Relógio lógico: incrementa antes de enviar cada mensagem
+def incrementar_relogio():
+    global relogio
+    relogio += 1
+    return relogio
+
+
+# Ao receber uma mensagem, fica com o maior valor entre o seu contador e o que veio na mensagem
+def atualizar_relogio(valor):
+    global relogio
+    if isinstance(valor, int):
+        relogio = max(relogio, valor)
 
 
 # converte o timestamp para data/hora no fuso do container
@@ -34,7 +57,7 @@ def exibir(direcao, msg):
     linhas = [f"[{NOME}] {direcao}"]
     if isinstance(msg, dict):
         for chave, valor in msg.items():
-            if chave == "timestamp" and isinstance(valor, int):
+            if chave in ("timestamp", "time") and isinstance(valor, int):
                 valor = f"{valor} ({formatar_ts(valor)})"
             linhas.append(f"    {chave:<10}: {valor}")
     else:
@@ -99,7 +122,8 @@ def publicar(db, req):
     if not mensagem or not isinstance(mensagem, str):
         return {"status": "error", "error": "mensagem vazia"}
 
-    publicacao = {"channel": canal, "user": str(req.get("user")), "message": mensagem, "timestamp": agora()}
+    publicacao = {"channel": canal, "user": str(req.get("user")), "message": mensagem,
+                  "timestamp": agora(), "clock": incrementar_relogio()}
     db.execute(
         "INSERT INTO publicacoes VALUES (?, ?, ?, ?, ?)",
         (canal, publicacao["user"], mensagem, req["timestamp"], publicacao["timestamp"]),
@@ -129,9 +153,11 @@ def tratar(db, dados):
         exibir("<<< RECEBIDO (invalido)", dados)
         return {"op": "unknown", "status": "error", "error": "mensagem nao esta em MessagePack"}
 
-    exibir("<<< RECEBIDO", req)
     if not isinstance(req, dict):
+        exibir("<<< RECEBIDO (invalido)", req)
         return {"op": "unknown", "status": "error", "error": "mensagem deve ser um mapa"}
+    atualizar_relogio(req.get("clock"))
+    exibir("<<< RECEBIDO", req)
 
     op = req.get("op")
     if not isinstance(req.get("timestamp"), int):
@@ -143,21 +169,56 @@ def tratar(db, dados):
     return {"op": op, **resultado}
 
 
+# Requisição para o serviço de referência: toda mensagem leva o nome, o timestamp e o relógio lógico
+def requisitar_referencia(op):
+    req = {"op": op, "name": NOME, "timestamp": agora(), "clock": incrementar_relogio()}
+    ref.send(msgpack.packb(req))
+    exibir(">>> ENVIADO (referencia)", req)
+    resposta = msgpack.unpackb(ref.recv())
+    atualizar_relogio(resposta.get("clock"))
+    exibir("<<< RECEBIDO (referencia)", resposta)
+    return resposta
+
+
+# Heartbeat a cada 10 mensagens de clientes. Na resposta vem a hora correta, então é ajustado no relógio considerando o tempo de ida e volta da mensagem: offset = hora_ref + (T4 - T1)/2 - T4
+def heartbeat():
+    global offset, servidores
+    t1 = time.time() * 1000
+    resposta = requisitar_referencia("heartbeat")
+    t4 = time.time() * 1000
+    if resposta.get("status") == "ok":
+        offset = int(resposta["time"] + (t4 - t1) / 2 - t4)
+        print(f"[{NOME}] relogio fisico ajustado: offset de {offset} ms em relacao ao relogio local", flush=True)
+    servidores = requisitar_referencia("list").get("servers", [])
+
+
 def main():
+    global rank
     db = abrir_db()
     # O servidor é o lado REP do Request-Reply e se conecta no DEALER do broker
     socket = context.socket(zmq.REP)
     socket.connect(BROKER)
     pub.connect(PROXY)
-    print(f"[{NOME}] conectado ao broker {BROKER} e ao proxy {PROXY}, dados em {DB_PATH}", flush=True)
+    ref.connect(REFERENCIA)
+    print(f"[{NOME}] conectado ao broker {BROKER}, ao proxy {PROXY} e a referencia {REFERENCIA}, dados em {DB_PATH}", flush=True)
+
+    # Ao iniciar, pede o seu rank para a referência
+    rank = requisitar_referencia("rank").get("rank")
+    print(f"[{NOME}] meu rank: {rank}", flush=True)
 
     # No REP é sempre recebe -> responde, uma requisição por vez
+    mensagens_clientes = 0
     while True:
         dados = socket.recv()
         resposta = tratar(db, dados)
         resposta["timestamp"] = agora()  # toda mensagem leva o timestamp do envio
+        resposta["clock"] = incrementar_relogio()  # e o relógio lógico de quem envia
         socket.send(msgpack.packb(resposta))
         exibir(">>> ENVIADO", resposta)
+
+        mensagens_clientes += 1
+        if mensagens_clientes % 10 == 0:
+            heartbeat()
 
 
 if __name__ == "__main__":
