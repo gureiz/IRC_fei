@@ -5,7 +5,7 @@ import msgpack
 import zmq
 
 # Serviço de referência: só conversa com os servidores (nunca com os bots).
-# Dá o rank de cada servidor, guarda a lista de servidores, recebe os heartbeats e informa a hora correta.
+# Dá o rank de cada servidor, guarda a lista de servidores e recebe os heartbeats.
 
 # tempo sem heartbeat (em ms) para o servidor sair da lista de disponíveis
 TIMEOUT_HEARTBEAT = 30000
@@ -67,13 +67,13 @@ def listar(req):
     return {"status": "ok", "servers": servidores}
 
 
-# Heartbeat: o servidor avisa que continua funcionando e aproveita para pegar a hora correta
+# Heartbeat: o servidor avisa que continua funcionando. A hora correta agora vem do coordenador, então só responde OK
 def heartbeat(req):
     nome = req.get("name")
     if nome not in ranks:
         return {"status": "error", "error": "servidor sem rank"}
     ultimo_heartbeat[nome] = agora()
-    return {"status": "ok", "time": agora()}
+    return {"status": "ok"}
 
 
 OPERACOES = {

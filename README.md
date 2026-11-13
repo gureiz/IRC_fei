@@ -1,6 +1,6 @@
 # Sistema para troca de mensagem instantânea
 
-É uma versão simples de um sistema de mensagens no estilo BBS/IRC: bots fazem login, listam e criam canais, se inscrevem em canais e publicam mensagens neles. Todas as mensagens levam um relógio lógico, e os servidores sincronizam o relógio físico com um serviço de referência. Toda a comunicação usa ZeroMQ e tudo roda em containers com Docker Compose.
+É uma versão simples de um sistema de mensagens no estilo BBS/IRC: bots fazem login, listam e criam canais, se inscrevem em canais e publicam mensagens neles. Todas as mensagens levam um relógio lógico, e os servidores elegem um coordenador entre eles para sincronizar o relógio físico. Toda a comunicação usa ZeroMQ e tudo roda em containers com Docker Compose.
 
 ### Como executar
 
@@ -14,8 +14,8 @@ docker compose up --build
 |-----------|-----------|--------|
 | `broker` | Python | Broker Request-Reply (ROUTER na porta 5555 para os clientes, DEALER na 5556 para os servidores) |
 | `proxy` | Python | Proxy Pub/Sub (XSUB na porta 5557 para os servidores, XPUB na 5558 para os bots) |
-| `referencia` | Python | Serviço de referência (REP na porta 5559): rank, lista de servidores, heartbeat e hora correta. Só fala com os servidores |
-| `servidor1`, `servidor2` | Python | Servidores (REP para as requisições, PUB para as publicações) |
+| `referencia` | Python | Serviço de referência (REP na porta 5559): rank, lista de servidores e heartbeat. Só fala com os servidores |
+| `servidor1`, `servidor2` | Python | Servidores (REP para as requisições dos bots, PUB para as publicações, REP na porta 5560 para os outros servidores, SUB no tópico `servers`) |
 | `cliente1`, `cliente2` | Java | Bots `bot1` e `bot2` (REQ para as requisições, SUB para receber as publicações) |
 
 ## Escolhas feitas
@@ -77,7 +77,7 @@ Bots, servidores e o serviço de referência têm um contador que começa em 0 j
 No bot, as duas threads (requisições e recebimento das publicações) usam o mesmo contador, por
 isso os métodos do relógio são `synchronized`.
 
-### Serviço de referência e relógio físico
+### Serviço de referência
 
 O serviço de referência é um container novo que só conversa com os servidores, por REQ/REP
 direto na porta 5559 (sem passar pelo broker). As mensagens seguem o mesmo formato (mapa
@@ -86,16 +86,48 @@ MessagePack com `op`, `name` do servidor, `timestamp` e `clock`):
 | Operação | Quando | Resposta |
 |----------|--------|----------|
 | `rank` | o servidor inicia | `rank` do servidor. O primeiro recebe 1, o segundo 2, e assim por diante; se o mesmo nome pedir de novo, recebe o mesmo rank (sem repetir nomes) |
-| `heartbeat` | a cada 10 mensagens de clientes recebidas | `status: ok` e `time`, a hora correta da referência |
-| `list` | logo depois do heartbeat | `servers`: lista com `name` e `rank` dos servidores disponíveis |
+| `heartbeat` | a cada 10 mensagens de clientes recebidas | `status: ok` (a hora não vem mais no heartbeat) |
+| `list` | logo depois do heartbeat e no início de cada eleição | `servers`: lista com `name` e `rank` dos servidores disponíveis |
 
 Se um servidor ficar 30 segundos sem enviar heartbeat, a referência o tira da lista de
 disponíveis. Se ele voltar a enviar, volta para a lista com o mesmo rank.
 
+### Eleição do coordenador
+
+Cada servidor guarda na variável `coordenador` o nome do servidor eleito. A eleição usa o
+algoritmo do valentão (bullying): o coordenador é o servidor de **maior rank** que
+responde.
+
+1. O servidor pede a lista de servidores à referência e envia `election` para cada servidor de
+   rank maior que o seu, pelo socket REP da porta 5560 do outro servidor (o host é o nome do
+   container, por exemplo `tcp://servidor2:5560`).
+2. Quem recebe `election` responde `status: ok` e começa a sua própria eleição.
+3. Se algum servidor de rank maior responder OK, quem pediu a eleição para e espera o aviso do
+   vencedor. Se nenhum responder em 2 segundos, ele é o coordenador.
+4. O vencedor publica o seu nome no tópico `servers` (pelo mesmo proxy do Pub/Sub), e todos os
+   servidores guardam esse nome em `coordenador`.
+
+A eleição acontece quando o servidor inicia (ele ainda não sabe quem é o coordenador) e quando o
+coordenador não responde ao pedido de sincronização do relógio.
+
+Para esperar a resposta com limite de tempo, cada requisição a outro servidor usa um socket REQ
+novo, que é fechado depois, porque um REQ que ficou sem resposta não consegue enviar outra mensagem.
+
+### Relógio físico: algoritmo de Berkeley
+
+A cada 15 mensagens trocadas com os clientes, o servidor que não é o coordenador envia `sync`
+para o coordenador com o seu relógio (o `timestamp` da mensagem) e recebe a hora correta (`time`).
+
+No coordenador, a hora correta é calculada como no algoritmo de Berkeley: ele guarda a diferença
+entre o relógio de cada servidor e o seu, faz a média das diferenças (o seu relógio entra com
+diferença 0), ajusta o seu próprio relógio para essa média e responde a hora já ajustada.
+
 Como o servidor não pode mudar o relógio do container, ele guarda a diferença (`offset`) entre a
 hora correta e o seu relógio, e passa a usar o relógio corrigido em todos os timestamps. O
-cálculo considera o tempo de ida e volta do heartbeat, como na aula: com T1 = envio e T4 =
-recebimento da resposta, `offset = hora_referencia + (T4 - T1) / 2 - T4`.
+cálculo considera o tempo de ida e volta da mensagem, como na aula: com T1 = envio e T4 =
+recebimento da resposta, `offset = hora_correta + (T4 - T1) / 2 - T4`.
+
+As mensagens entre servidores e o aviso no tópico `servers` também levam `timestamp` e `clock`.
 
 ### Comportamento do bot
 

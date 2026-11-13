@@ -10,22 +10,31 @@ import zmq
 NOME = os.environ.get("SERVER_NAME", "servidor")
 BROKER = os.environ.get("BROKER_ADDR", "tcp://broker:5556")
 PROXY = os.environ.get("PROXY_ADDR", "tcp://proxy:5557")
+PROXY_SUB = os.environ.get("PROXY_SUB_ADDR", "tcp://proxy:5558")
 REFERENCIA = os.environ.get("REFERENCIA_ADDR", "tcp://referencia:5559")
+PORTA_SERVIDORES = os.environ.get("PORTA_SERVIDORES", "5560")
 DB_PATH = os.environ.get("DB_PATH", f"/data/{NOME}.db")
+
+# tempo (ms) que espero a resposta de outro servidor antes de considerar que ele não está disponível
+TIMEOUT_SERVIDOR = 2000
 
 context = zmq.Context()
 # PUB: o servidor publica as mensagens no proxy, usando o nome do canal como tópico
 pub = context.socket(zmq.PUB)
+# SUB: recebe do proxy os avisos de novo coordenador, no tópico "servers"
+sub = context.socket(zmq.SUB)
 # REQ: requisições ao serviço de referência (rank, lista de servidores e heartbeat)
 ref = context.socket(zmq.REQ)
 
-relogio = 0       # relógio lógico, começa junto com o processo
-offset = 0        # diferença (ms) entre o relógio local e a hora correta da referência
+relogio = 0         # relógio lógico, começa junto com o processo
+offset = 0          # diferença (ms) entre o relógio local e a hora do coordenador
 rank = None
-servidores = []   # última lista de servidores recebida da referência
+servidores = []     # última lista de servidores recebida da referência
+coordenador = None  # nome do servidor eleito como coordenador
+diferencas = {}     # usado só pelo coordenador: nome do servidor -> diferença do relógio dele para o meu
 
 
-# Timestamp em milissegundos, já corrigido com a hora da referência
+# Timestamp em milissegundos, já corrigido com a hora do coordenador
 def agora():
     return int(time.time() * 1000) + offset
 
@@ -180,16 +189,132 @@ def requisitar_referencia(op):
     return resposta
 
 
-# Heartbeat a cada 10 mensagens de clientes. Na resposta vem a hora correta, então é ajustado no relógio considerando o tempo de ida e volta da mensagem: offset = hora_ref + (T4 - T1)/2 - T4
+# Heartbeat a cada 10 mensagens de clientes, avisando a referência que continuo funcionando.
+# A hora agora vem do coordenador, então depois do heartbeat só pego a lista de servidores disponíveis.
 def heartbeat():
-    global offset, servidores
-    t1 = time.time() * 1000
-    resposta = requisitar_referencia("heartbeat")
-    t4 = time.time() * 1000
-    if resposta.get("status") == "ok":
-        offset = int(resposta["time"] + (t4 - t1) / 2 - t4)
-        print(f"[{NOME}] relogio fisico ajustado: offset de {offset} ms em relacao ao relogio local", flush=True)
+    global servidores
+    requisitar_referencia("heartbeat")
     servidores = requisitar_referencia("list").get("servers", [])
+
+
+# Endereço do socket que cada servidor usa para falar com os outros servidores (o nome do container é o host)
+def endereco(nome):
+    return f"tcp://{nome}:{PORTA_SERVIDORES}"
+
+
+# Requisição para outro servidor (sincronização do relógio ou eleição).
+# Um REQ novo a cada requisição e espera no máximo TIMEOUT_SERVIDOR: se não vier resposta, o servidor não está disponível e devolve None. O socket é fechado nos dois casos, porque o REQ que ficou sem resposta não consegue enviar de novo.
+def requisitar_servidor(nome, op):
+    req = {"op": op, "name": NOME, "timestamp": agora(), "clock": incrementar_relogio()}
+    socket = context.socket(zmq.REQ)
+    socket.setsockopt(zmq.LINGER, 0)
+    socket.connect(endereco(nome))
+    socket.send(msgpack.packb(req))
+    exibir(f">>> ENVIADO ({nome})", req)
+
+    resposta = None
+    if socket.poll(TIMEOUT_SERVIDOR):
+        resposta = msgpack.unpackb(socket.recv())
+        atualizar_relogio(resposta.get("clock"))
+        exibir(f"<<< RECEBIDO ({nome})", resposta)
+    else:
+        print(f"[{NOME}] {nome} nao respondeu em {TIMEOUT_SERVIDOR} ms", flush=True)
+    socket.close()
+    return resposta
+
+
+# Eleição pelo algoritmo do valentão (bullying): peço eleição para todos os servidores de rank maior que o meu.
+# Se algum responder OK, ele continua a eleição e depois avisa quem ganhou. Se nenhum responder, eu sou o coordenador.
+def eleicao():
+    global coordenador, servidores
+    print(f"[{NOME}] iniciando eleicao (meu rank: {rank})", flush=True)
+    coordenador = None
+    servidores = requisitar_referencia("list").get("servers", [])
+    for servidor in servidores:
+        if servidor["rank"] > rank:
+            resposta = requisitar_servidor(servidor["name"], "election")
+            if resposta is not None and resposta.get("status") == "ok":
+                return
+    anunciar_coordenador()
+
+
+# Quando sou eleito, aviso todos os servidores publicando o meu nome no tópico "servers"
+def anunciar_coordenador():
+    global coordenador
+    coordenador = NOME
+    aviso = {"coordinator": NOME, "timestamp": agora(), "clock": incrementar_relogio()}
+    pub.send_multipart([b"servers", msgpack.packb(aviso)])
+    exibir(">>> PUBLICADO [servers]", aviso)
+
+
+# Aviso de novo coordenador recebido pelo tópico "servers": guardo o nome dele
+def receber_aviso():
+    global coordenador
+    _, dados = sub.recv_multipart()
+    aviso = msgpack.unpackb(dados)
+    atualizar_relogio(aviso.get("clock"))
+    exibir("<<< RECEBIDO [servers]", aviso)
+    coordenador = aviso.get("coordinator")
+    print(f"[{NOME}] coordenador: {coordenador}", flush=True)
+
+
+# Sincronização do relógio a cada 15 mensagens trocadas (algoritmo de Berkeley).
+# Envia o relógio (o timestamp da mensagem) para o coordenador, que responde a hora correta. Ajusta o relógio considerando o tempo de ida e volta da mensagem: offset = hora_correta + (T4 - T1)/2 - T4.
+# Se o coordenador não responder, ele não está disponível e pede uma nova eleição.
+def sincronizar_relogio():
+    global offset
+    if coordenador == NOME:
+        return
+    if coordenador is None:
+        eleicao()
+        return
+    t1 = time.time() * 1000
+    resposta = requisitar_servidor(coordenador, "sync")
+    t4 = time.time() * 1000
+    if resposta is None or resposta.get("status") != "ok":
+        print(f"[{NOME}] coordenador {coordenador} indisponivel", flush=True)
+        eleicao()
+        return
+    offset = int(resposta["time"] + (t4 - t1) / 2 - t4)
+    print(f"[{NOME}] relogio fisico ajustado com o coordenador {coordenador}: offset de {offset} ms", flush=True)
+
+
+# Berkeley no coordenador: guarda a diferença entre o relógio de cada servidor e o meu, e a hora correta é a média dos relógios (o meu entra com diferença 0). também ajusta o relógio para essa média.
+def hora_correta(req):
+    global offset
+    nome = req.get("name")
+    diferencas[nome] = req["timestamp"] - agora()
+    media = int(sum(diferencas.values()) / (len(diferencas) + 1))
+    offset += media
+    for outro in diferencas:
+        diferencas[outro] -= media  # as diferenças são em relação ao meu relógio, que mudou
+    diferencas[nome] = 0            # o servidor vai acertar o relógio com a hora que eu responder
+    return {"status": "ok", "time": agora()}
+
+
+# Atende as requisições dos outros servidores: pedido de hora (só o coordenador responde) e pedido de eleição
+def atender_servidor(socket):
+    req = msgpack.unpackb(socket.recv())
+    atualizar_relogio(req.get("clock"))
+    exibir(f"<<< RECEBIDO ({req.get('name')})", req)
+
+    op = req.get("op")
+    if op == "sync" and coordenador == NOME:
+        resposta = {"op": op, **hora_correta(req)}
+    elif op == "sync":
+        resposta = {"op": op, "status": "error", "error": "nao sou o coordenador"}
+    elif op == "election":
+        resposta = {"op": op, "status": "ok"}
+    else:
+        resposta = {"op": op, "status": "error", "error": f"operacao desconhecida: {op}"}
+    resposta["timestamp"] = agora()
+    resposta["clock"] = incrementar_relogio()
+    socket.send(msgpack.packb(resposta))
+    exibir(f">>> ENVIADO ({req.get('name')})", resposta)
+
+    # Depois de responder OK, o servidor de rank maior continua a eleição
+    if op == "election":
+        eleicao()
 
 
 def main():
@@ -198,7 +323,12 @@ def main():
     # O servidor é o lado REP do Request-Reply e se conecta no DEALER do broker
     socket = context.socket(zmq.REP)
     socket.connect(BROKER)
+    # REP para as requisições dos outros servidores (relógio e eleição)
+    servidores_rep = context.socket(zmq.REP)
+    servidores_rep.bind(f"tcp://*:{PORTA_SERVIDORES}")
     pub.connect(PROXY)
+    sub.connect(PROXY_SUB)
+    sub.setsockopt(zmq.SUBSCRIBE, b"servers")
     ref.connect(REFERENCIA)
     print(f"[{NOME}] conectado ao broker {BROKER}, ao proxy {PROXY} e a referencia {REFERENCIA}, dados em {DB_PATH}", flush=True)
 
@@ -206,19 +336,37 @@ def main():
     rank = requisitar_referencia("rank").get("rank")
     print(f"[{NOME}] meu rank: {rank}", flush=True)
 
-    # No REP é sempre recebe -> responde, uma requisição por vez
+    # Espero um pouco para as conexões com o proxy ficarem prontas, senão o aviso de coordenador pode se perder.
+    # Ao iniciar ainda não sei quem é o coordenador, então peço uma eleição.
+    time.sleep(1)
+    eleicao()
+
+    # O servidor espera mensagens em três sockets: clientes (pelo broker), outros servidores e avisos do tópico "servers"
+    poller = zmq.Poller()
+    poller.register(socket, zmq.POLLIN)
+    poller.register(servidores_rep, zmq.POLLIN)
+    poller.register(sub, zmq.POLLIN)
+
     mensagens_clientes = 0
     while True:
-        dados = socket.recv()
-        resposta = tratar(db, dados)
-        resposta["timestamp"] = agora()  # toda mensagem leva o timestamp do envio
-        resposta["clock"] = incrementar_relogio()  # e o relógio lógico de quem envia
-        socket.send(msgpack.packb(resposta))
-        exibir(">>> ENVIADO", resposta)
+        eventos = dict(poller.poll())
+        if sub in eventos:
+            receber_aviso()
+        if servidores_rep in eventos:
+            atender_servidor(servidores_rep)
+        if socket in eventos:
+            # No REP é sempre recebe -> responde, uma requisição por vez
+            resposta = tratar(db, socket.recv())
+            resposta["timestamp"] = agora()  # toda mensagem leva o timestamp do envio
+            resposta["clock"] = incrementar_relogio()  # e o relógio lógico de quem envia
+            socket.send(msgpack.packb(resposta))
+            exibir(">>> ENVIADO", resposta)
 
-        mensagens_clientes += 1
-        if mensagens_clientes % 10 == 0:
-            heartbeat()
+            mensagens_clientes += 1
+            if mensagens_clientes % 10 == 0:
+                heartbeat()
+            if mensagens_clientes % 15 == 0:
+                sincronizar_relogio()
 
 
 if __name__ == "__main__":
