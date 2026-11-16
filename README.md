@@ -1,6 +1,6 @@
 # Sistema para troca de mensagem instantânea
 
-É uma versão simples de um sistema de mensagens no estilo BBS/IRC: bots fazem login, listam e criam canais, se inscrevem em canais e publicam mensagens neles. Todas as mensagens levam um relógio lógico, e os servidores elegem um coordenador entre eles para sincronizar o relógio físico. Toda a comunicação usa ZeroMQ e tudo roda em containers com Docker Compose.
+É uma versão simples de um sistema de mensagens no estilo BBS/IRC: bots fazem login, listam e criam canais, se inscrevem em canais e publicam mensagens neles. Todas as mensagens levam um relógio lógico, os servidores elegem um coordenador entre eles para sincronizar o relógio físico e todos os servidores guardam uma cópia de todos os dados (réplica). Toda a comunicação usa ZeroMQ e tudo roda em containers com Docker Compose.
 
 ### Como executar
 
@@ -15,7 +15,7 @@ docker compose up --build
 | `broker` | Python | Broker Request-Reply (ROUTER na porta 5555 para os clientes, DEALER na 5556 para os servidores) |
 | `proxy` | Python | Proxy Pub/Sub (XSUB na porta 5557 para os servidores, XPUB na 5558 para os bots) |
 | `referencia` | Python | Serviço de referência (REP na porta 5559): rank, lista de servidores e heartbeat. Só fala com os servidores |
-| `servidor1`, `servidor2` | Python | Servidores (REP para as requisições dos bots, PUB para as publicações, REP na porta 5560 para os outros servidores, SUB no tópico `servers`) |
+| `servidor1`, `servidor2` | Python | Servidores (REP para as requisições dos bots, PUB para as publicações, REP na porta 5560 para os outros servidores, SUB nos tópicos `servers` e `replica`) |
 | `cliente1`, `cliente2` | Java | Bots `bot1` e `bot2` (REQ para as requisições, SUB para receber as publicações) |
 
 ## Escolhas feitas
@@ -95,7 +95,7 @@ disponíveis. Se ele voltar a enviar, volta para a lista com o mesmo rank.
 ### Eleição do coordenador
 
 Cada servidor guarda na variável `coordenador` o nome do servidor eleito. A eleição usa o
-algoritmo do valentão (bullying): o coordenador é o servidor de **maior rank** que
+algoritmo do valentão (bullying) visto em aula: o coordenador é o servidor de **maior rank** que
 responde.
 
 1. O servidor pede a lista de servidores à referência e envia `election` para cada servidor de
@@ -127,7 +127,7 @@ hora correta e o seu relógio, e passa a usar o relógio corrigido em todos os t
 cálculo considera o tempo de ida e volta da mensagem, como na aula: com T1 = envio e T4 =
 recebimento da resposta, `offset = hora_correta + (T4 - T1) / 2 - T4`.
 
-As mensagens entre servidores e o aviso no tópico `servers` também levam `timestamp` e `clock`.
+As mensagens entre servidores e as mensagens dos tópicos `servers` e `replica` também levam `timestamp` e `clock`.
 
 ### Comportamento do bot
 
@@ -147,8 +147,44 @@ que não é compartilhado entre eles. Ele guarda:
 - `publicacoes`: canal, usuário, mensagem, timestamp do envio da requisição pelo bot e timestamp
   da publicação pelo servidor. Com isso dá para recuperar todas as publicações depois.
 
-Como cada servidor guarda só os seus dados, um canal só aparece para quem for atendido pelo
-servidor que o criou.
+Com a réplica (seção abaixo), os dois arquivos ficam com os mesmos dados.
+
+### Consistência e réplica dos dados
+
+**Problema:** o broker distribui as requisições entre os servidores com round-robin, então cada
+servidor recebia só uma parte dos logins, canais e publicações. Se um servidor parasse, essa parte
+do histórico se perdia, e um bot só via os canais criados no servidor que o atendia.
+
+**Método escolhido: réplica ativa com atualização por push**, em vez de copiar o banco inteiro entre os servidores (réplica passiva), cada servidor propaga a **operação de atualização** para os outros, que executam a mesma operação no seu banco.
+A atualização é iniciada pelo servidor que recebeu a escrita (push).
+
+**Como foi implementado:**
+1. Quando um servidor executa uma operação de escrita de um bot (`login`, `create_channel` ou
+   `publish`), ele salva no seu banco, publica a operação no tópico `replica` (pelo mesmo proxy
+   do Pub/Sub) e responde o bot. A mensagem leva `op`, `origin` (quem fez a operação), `data` (os
+   dados já com os timestamps definidos pelo servidor de origem), `timestamp` e `clock`.
+2. Todos os servidores estão inscritos no tópico `replica` e executam a operação recebida no seu
+   banco. A própria mensagem também chega para quem publicou e é ignorada. Os bots não recebem
+   essas mensagens, porque só se inscrevem nos tópicos dos canais.
+3. A réplica de uma publicação só grava no banco: ela não é publicada de novo no canal, senão os
+   bots receberiam a mesma mensagem duas vezes.
+
+**Mudanças no método para funcionar no projeto:**
+- **Servidor que estava parado:** a propagação por Pub/Sub não guarda mensagens para quem não está
+  conectado, então um servidor que ficou parado perderia as operações desse período. Por isso,
+  ao iniciar, o servidor também faz uma **atualização por pull**: pede o histórico (`history`) a
+  outro servidor disponível, pelo REP da porta 5560, e insere o que estiver faltando. Assim os
+  bancos voltam a ficar iguais (consistência eventual: depois que as atualizações param de chegar,
+  todas as réplicas têm os mesmos dados).
+- **Operações repetidas:** a mesma operação pode chegar pelo tópico e pelo histórico, então antes
+  de inserir o servidor confere se aquela linha já existe.
+- **Ordem e conflitos:** na réplica ativa clássica todas as réplicas executam as operações na mesma
+  ordem. Aqui as operações chegam em servidores diferentes e não há uma ordem global, mas logins e
+  publicações não conflitam entre si (cada um é uma linha nova), então a ordem não muda o resultado
+  final. O único conflito possível é o mesmo canal ser criado em dois servidores ao mesmo tempo:
+  nesse caso, como na consistência eventual forte, os dois ficam com a criação de
+  **menor timestamp**, que dá para comparar porque os relógios são sincronizados pelo coordenador
+  (Berkeley).
 
 ### Exibição das mensagens
 

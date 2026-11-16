@@ -98,8 +98,10 @@ def login(db, req):
     usuario = req.get("user")
     if not usuario or not isinstance(usuario, str):
         return {"status": "error", "error": "nome de usuario vazio"}
-    db.execute("INSERT INTO logins VALUES (?, ?)", (usuario, agora()))
+    dados = {"user": usuario, "timestamp": agora()}
+    db.execute("INSERT INTO logins VALUES (?, ?)", (usuario, dados["timestamp"]))
     db.commit()
+    replicar("login", dados)
     return {"status": "ok"}
 
 
@@ -108,11 +110,13 @@ def criar_canal(db, req):
     canal = req.get("channel")
     if not canal or not isinstance(canal, str):
         return {"status": "error", "error": "nome de canal vazio"}
+    dados = {"channel": canal, "user": str(req.get("user")), "timestamp": agora()}
     try:
-        db.execute("INSERT INTO canais VALUES (?, ?, ?)", (canal, str(req.get("user")), agora()))
+        db.execute("INSERT INTO canais VALUES (?, ?, ?)", (canal, dados["user"], dados["timestamp"]))
         db.commit()
     except sqlite3.IntegrityError:
         return {"status": "error", "error": f"canal '{canal}' ja existe"}
+    replicar("create_channel", dados)
     return {"status": "ok"}
 
 
@@ -142,7 +146,72 @@ def publicar(db, req):
     # a publicação vai em duas partes: o tópico e a mensagem serializada em MessagePack
     pub.send_multipart([canal.encode(), msgpack.packb(publicacao)])
     exibir(f">>> PUBLICADO [{canal}]", publicacao)
+    replicar("publish", {"channel": canal, "user": publicacao["user"], "message": mensagem,
+                         "timestamp_envio": req["timestamp"], "timestamp_publicacao": publicacao["timestamp"]})
     return {"status": "ok"}
+
+
+# Réplica ativa com atualização por push: toda operação de escrita que recebe de um cliente é propagada para os outros servidores, que executam a mesma operação no banco deles. A propagação usa o Pub/Sub, no tópico "replica", e leva os dados já com os timestamps definidos por mim, para todos guardarem igual.
+def replicar(op, dados):
+    msg = {"op": op, "origin": NOME, "data": dados, "timestamp": agora(), "clock": incrementar_relogio()}
+    pub.send_multipart([b"replica", msgpack.packb(msg)])
+    exibir(">>> PUBLICADO [replica]", msg)
+
+
+# Executa no banco uma operação que veio de outro servidor (pela réplica ou pelo histórico).
+# A mesma operação pode chegar duas vezes (pelo tópico e pelo histórico), então não insiro o que já existe.
+def aplicar_operacao(db, op, dados):
+    if op == "login":
+        db.execute(
+            "INSERT INTO logins SELECT ?, ? WHERE NOT EXISTS (SELECT 1 FROM logins WHERE usuario = ? AND timestamp = ?)",
+            (dados["user"], dados["timestamp"], dados["user"], dados["timestamp"]),
+        )
+    elif op == "create_channel":
+        # Conflito: o mesmo canal criado em dois servidores ao mesmo tempo. Fica com a criação mais antiga (menor timestamp, que dá para comparar porque os relógios são sincronizados com o coordenador).
+        linha = db.execute("SELECT timestamp FROM canais WHERE nome = ?", (dados["channel"],)).fetchone()
+        if linha is None:
+            db.execute("INSERT INTO canais VALUES (?, ?, ?)", (dados["channel"], dados["user"], dados["timestamp"]))
+        elif dados["timestamp"] < linha[0]:
+            db.execute("UPDATE canais SET criador = ?, timestamp = ? WHERE nome = ?",
+                       (dados["user"], dados["timestamp"], dados["channel"]))
+    elif op == "publish":
+        db.execute(
+            "INSERT INTO publicacoes SELECT ?, ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM publicacoes "
+            "WHERE canal = ? AND usuario = ? AND mensagem = ? AND timestamp_envio = ?)",
+            (dados["channel"], dados["user"], dados["message"], dados["timestamp_envio"], dados["timestamp_publicacao"],
+             dados["channel"], dados["user"], dados["message"], dados["timestamp_envio"]),
+        )
+    db.commit()
+
+
+# Histórico completo do banco, para enviar a um servidor que acabou de iniciar
+def historico(db):
+    return {
+        "status": "ok",
+        "logins": [{"user": u, "timestamp": t} for u, t in db.execute("SELECT * FROM logins")],
+        "channels": [{"channel": c, "user": u, "timestamp": t} for c, u, t in db.execute("SELECT * FROM canais")],
+        "publications": [
+            {"channel": c, "user": u, "message": m, "timestamp_envio": te, "timestamp_publicacao": tp}
+            for c, u, m, te, tp in db.execute("SELECT * FROM publicacoes")
+        ],
+    }
+
+
+# Atualização por pull ao iniciar: o servidor pode ter ficado parado e perdido operações propagadas nesse tempo, então requisita ao histórico para outro servidor disponível e insiro o que estiver faltando.
+def buscar_historico(db):
+    for servidor in servidores:
+        if servidor["name"] == NOME:
+            continue
+        resposta = requisitar_servidor(servidor["name"], "history")
+        if resposta is not None and resposta.get("status") == "ok":
+            for dados in resposta["logins"]:
+                aplicar_operacao(db, "login", dados)
+            for dados in resposta["channels"]:
+                aplicar_operacao(db, "create_channel", dados)
+            for dados in resposta["publications"]:
+                aplicar_operacao(db, "publish", dados)
+            print(f"[{NOME}] historico recebido de {servidor['name']}", flush=True)
+            return
 
 
 # Cada valor do campo "op" da mensagem chama uma função
@@ -189,8 +258,8 @@ def requisitar_referencia(op):
     return resposta
 
 
-# Heartbeat a cada 10 mensagens de clientes, avisando a referência que continuo funcionando.
-# A hora agora vem do coordenador, então depois do heartbeat só pego a lista de servidores disponíveis.
+# Heartbeat a cada 10 mensagens de clientes, avisando a referência que continua funcionando.
+# A hora agora vem do coordenador, então depois do heartbeat só pega a lista de servidores disponíveis.
 def heartbeat():
     global servidores
     requisitar_referencia("heartbeat")
@@ -203,7 +272,7 @@ def endereco(nome):
 
 
 # Requisição para outro servidor (sincronização do relógio ou eleição).
-# Um REQ novo a cada requisição e espera no máximo TIMEOUT_SERVIDOR: se não vier resposta, o servidor não está disponível e devolve None. O socket é fechado nos dois casos, porque o REQ que ficou sem resposta não consegue enviar de novo.
+# Usa um REQ novo a cada requisição e espero no máximo TIMEOUT_SERVIDOR: se não vier resposta, o servidor não está disponível e devolve None. O socket é fechado nos dois casos, porque o REQ que ficou sem resposta não consegue enviar de novo.
 def requisitar_servidor(nome, op):
     req = {"op": op, "name": NOME, "timestamp": agora(), "clock": incrementar_relogio()}
     socket = context.socket(zmq.REQ)
@@ -223,7 +292,7 @@ def requisitar_servidor(nome, op):
     return resposta
 
 
-# Eleição pelo algoritmo do valentão (bullying): peço eleição para todos os servidores de rank maior que o meu.
+# Eleição pelo algoritmo do valentão (bullying): pede eleição para todos os servidores de rank maior que o atual.
 # Se algum responder OK, ele continua a eleição e depois avisa quem ganhou. Se nenhum responder, eu sou o coordenador.
 def eleicao():
     global coordenador, servidores
@@ -247,19 +316,29 @@ def anunciar_coordenador():
     exibir(">>> PUBLICADO [servers]", aviso)
 
 
-# Aviso de novo coordenador recebido pelo tópico "servers": guardo o nome dele
-def receber_aviso():
+# Mensagens recebidas pelo SUB:
+# - tópico "servers": aviso de novo coordenador, guarda o nome dele;
+# - tópico "replica": operação de escrita feita em outro servidor, executa no banco.
+#   A própria propagação também chega aqui e é ignorada.
+def receber_sub(db):
     global coordenador
-    _, dados = sub.recv_multipart()
-    aviso = msgpack.unpackb(dados)
-    atualizar_relogio(aviso.get("clock"))
-    exibir("<<< RECEBIDO [servers]", aviso)
-    coordenador = aviso.get("coordinator")
-    print(f"[{NOME}] coordenador: {coordenador}", flush=True)
+    topico, dados = sub.recv_multipart()
+    msg = msgpack.unpackb(dados)
+    if topico == b"replica" and msg.get("origin") == NOME:
+        return
+    atualizar_relogio(msg.get("clock"))
+    exibir(f"<<< RECEBIDO [{topico.decode()}]", msg)
+    if topico == b"servers":
+        coordenador = msg.get("coordinator")
+        print(f"[{NOME}] coordenador: {coordenador}", flush=True)
+    else:
+        aplicar_operacao(db, msg["op"], msg["data"])
+        print(f"[{NOME}] replica aplicada: {msg['op']} vindo de {msg['origin']}", flush=True)
 
 
 # Sincronização do relógio a cada 15 mensagens trocadas (algoritmo de Berkeley).
-# Envia o relógio (o timestamp da mensagem) para o coordenador, que responde a hora correta. Ajusta o relógio considerando o tempo de ida e volta da mensagem: offset = hora_correta + (T4 - T1)/2 - T4.
+# Envia o relógio (o timestamp da mensagem) para o coordenador, que responde a hora correta. Ajusta o relógio considerando
+# o tempo de ida e volta da mensagem: offset = hora_correta + (T4 - T1)/2 - T4.
 # Se o coordenador não responder, ele não está disponível e pede uma nova eleição.
 def sincronizar_relogio():
     global offset
@@ -279,7 +358,7 @@ def sincronizar_relogio():
     print(f"[{NOME}] relogio fisico ajustado com o coordenador {coordenador}: offset de {offset} ms", flush=True)
 
 
-# Berkeley no coordenador: guarda a diferença entre o relógio de cada servidor e o meu, e a hora correta é a média dos relógios (o meu entra com diferença 0). também ajusta o relógio para essa média.
+# Berkeley no coordenador: guardo a diferença entre o relógio de cada servidor e o meu, e a hora correta é a média dos relógios (entra com diferença 0). Eu também ajusta o relógio para essa média.
 def hora_correta(req):
     global offset
     nome = req.get("name")
@@ -287,13 +366,13 @@ def hora_correta(req):
     media = int(sum(diferencas.values()) / (len(diferencas) + 1))
     offset += media
     for outro in diferencas:
-        diferencas[outro] -= media  # as diferenças são em relação ao meu relógio, que mudou
-    diferencas[nome] = 0            # o servidor vai acertar o relógio com a hora que eu responder
+        diferencas[outro] -= media  # as diferenças são em relação ao relógio, que mudou
+    diferencas[nome] = 0            # o servidor vai acertar o relógio com a hora que responder
     return {"status": "ok", "time": agora()}
 
 
-# Atende as requisições dos outros servidores: pedido de hora (só o coordenador responde) e pedido de eleição
-def atender_servidor(socket):
+# Atende as requisições dos outros servidores: pedido de hora (só o coordenador responde), pedido de eleição e pedido do histórico (de um servidor que acabou de iniciar)
+def atender_servidor(socket, db):
     req = msgpack.unpackb(socket.recv())
     atualizar_relogio(req.get("clock"))
     exibir(f"<<< RECEBIDO ({req.get('name')})", req)
@@ -305,6 +384,8 @@ def atender_servidor(socket):
         resposta = {"op": op, "status": "error", "error": "nao sou o coordenador"}
     elif op == "election":
         resposta = {"op": op, "status": "ok"}
+    elif op == "history":
+        resposta = {"op": op, **historico(db)}
     else:
         resposta = {"op": op, "status": "error", "error": f"operacao desconhecida: {op}"}
     resposta["timestamp"] = agora()
@@ -323,12 +404,13 @@ def main():
     # O servidor é o lado REP do Request-Reply e se conecta no DEALER do broker
     socket = context.socket(zmq.REP)
     socket.connect(BROKER)
-    # REP para as requisições dos outros servidores (relógio e eleição)
+    # REP para as requisições dos outros servidores (relógio, eleição e histórico)
     servidores_rep = context.socket(zmq.REP)
     servidores_rep.bind(f"tcp://*:{PORTA_SERVIDORES}")
     pub.connect(PROXY)
     sub.connect(PROXY_SUB)
     sub.setsockopt(zmq.SUBSCRIBE, b"servers")
+    sub.setsockopt(zmq.SUBSCRIBE, b"replica")
     ref.connect(REFERENCIA)
     print(f"[{NOME}] conectado ao broker {BROKER}, ao proxy {PROXY} e a referencia {REFERENCIA}, dados em {DB_PATH}", flush=True)
 
@@ -336,12 +418,14 @@ def main():
     rank = requisitar_referencia("rank").get("rank")
     print(f"[{NOME}] meu rank: {rank}", flush=True)
 
-    # Espero um pouco para as conexões com o proxy ficarem prontas, senão o aviso de coordenador pode se perder.
+    # Espera um pouco para as conexões com o proxy ficarem prontas, senão o aviso de coordenador pode se perder.
     # Ao iniciar ainda não sei quem é o coordenador, então peço uma eleição.
     time.sleep(1)
     eleicao()
+    # Pego com outro servidor o que foi feito enquanto eu estava parado
+    buscar_historico(db)
 
-    # O servidor espera mensagens em três sockets: clientes (pelo broker), outros servidores e avisos do tópico "servers"
+    # O servidor espera mensagens em três sockets: clientes (pelo broker), outros servidores e o SUB (tópicos "servers" e "replica")
     poller = zmq.Poller()
     poller.register(socket, zmq.POLLIN)
     poller.register(servidores_rep, zmq.POLLIN)
@@ -351,9 +435,9 @@ def main():
     while True:
         eventos = dict(poller.poll())
         if sub in eventos:
-            receber_aviso()
+            receber_sub(db)
         if servidores_rep in eventos:
-            atender_servidor(servidores_rep)
+            atender_servidor(servidores_rep, db)
         if socket in eventos:
             # No REP é sempre recebe -> responde, uma requisição por vez
             resposta = tratar(db, socket.recv())
